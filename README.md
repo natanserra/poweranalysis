@@ -1,97 +1,76 @@
-# Mini RSA — ataque de raiz e-ésima (expoente pequeno)
+Power Analysis Warmup — vazamento do bit menos significativo da S-box
 
-Este script quebra uma cifra RSA onde o expoente público `e` é **pequeno**
-(tipicamente 3) e a mensagem não tem padding suficiente para evitar o
-"estouro" controlado de `M^e` em relação a `N`.
+Este script quebra uma chave de 16 bytes (AES-like) explorando um servidor que, para cada byte de um plaintext cifrado, vaza se o resultado do S-box foi par ou ímpar. É a versão "de aquecimento" do ataque de canal lateral, bem mais simples que o CPA (não precisa de estatística sobre centenas de amostras — cada byte pode ser determinado quase com certeza).
 
----
+1. A ideia por trás do ataque
+O que o servidor faz
 
-## 1. A ideia por trás do ataque
+O código-fonte do desafio (encrypt.py) mostrado pelo organizador revela exatamente o que acontece:
 
-No RSA normal, `c = M^e mod N`. Quando `e` é pequeno e `M` não é
-"inflado" o suficiente por um bom esquema de padding, pode acontecer de
-`M^e` ser **apenas um pouco maior** que `N` — ou seja, a operação de
-módulo só subtraiu `N` umas poucas vezes.
+python
+def leaky_aes_secret(data_byte, key_byte):
+    out = Sbox[data_byte ^ key_byte]
+    leak_buf.append(out & 0x01)   # guarda so o ultimo bit do resultado
+    return out
 
-Formalmente:
-```
-c = M^e mod N = M^e - k*N,  para algum inteiro k pequeno (0, 1, 2, ...)
-```
+def encrypt_and_leak(plaintext):
+    ciphertext = encrypt(plaintext, SECRET_KEY)
+    return leak_buf.count(1)      # soma dos bits guardados, 1 numero so
 
-Reorganizando:
-```
-M^e = c + k*N
-```
+Ou seja: para os 16 bytes do plaintext, o servidor calcula Sbox[plaintext[i] XOR chave[i]], guarda só o bit menos significativo desse resultado (0 se for par, 1 se for ímpar), e no final devolve a soma desses 16 bits — um único número entre 0 e 16.
 
-Se testarmos `k = 0, 1, 2, ...` e, para cada um, verificarmos se
-`c + k*N` é uma **potência e-ésima perfeita**, eventualmente encontramos o
-`k` certo — e a raiz e-ésima exata desse número é a mensagem `M`.
+Por que isso é suficiente para quebrar a chave
 
-Esse é um ataque bem mais rápido que fatorar `N`: não precisa descobrir
-`p` e `q` nem calcular a chave privada `d` — a mensagem sai direto da
-raiz.
+O número total sozinho não diria muito, mas o ataque usa uma técnica de isolamento por diferença:
 
----
+Primeiro, manda um plaintext todo zero e guarda o total (baseline).
+Para descobrir o byte i da chave, manda vários plaintexts onde só o byte i muda (os outros continuam zero). Qualquer variação no total em relação ao baseline só pode vir daquele byte, porque os outros 15 bytes do S-box não mudaram.
+Com algumas amostras (10-15 valores diferentes de x testados naquele byte), dá para comparar o padrão observado com o padrão que cada uma das 256 chaves possíveis prediria, e sobra só uma chave consistente com tudo que foi medido.
 
-## 2. Estrutura do código
+Isso é bem mais "limpo" que o CPA: aqui não tem ruído físico de verdade, o vazamento é determinístico (sempre o mesmo valor para a mesma entrada), só que agregado em uma soma. Por isso bastam algumas dezenas de consultas por byte, em vez de centenas de traces.
 
-### `raiz_inteira(x, n)`
+2. Estrutura do código
+Constantes
+python
+HOST = "chatelaine.cylabacademy.net"
+PORT = 20335
 
-Calcula a maior raiz inteira `r` tal que `r**n <= x`, **sem usar números
-de ponto flutuante** (`float`). Isso é essencial: `x ** (1/n)` em Python
-perde precisão para números muito grandes (centenas de dígitos), o que
-faria o ataque falhar silenciosamente (um `round()` levemente errado nunca
-bate com o valor exato).
+Endereço do servidor do desafio.
 
-A implementação usa **busca binária**:
-1. Dobra um limite superior (`hi`) até ultrapassar `x` na potência `n`.
-2. Faz busca binária entre `lo` e `hi` até encontrar o maior `r` que
-   satisfaz `r**n <= x`.
+python
+Sbox = (0x63, 0x7C, ...)
 
-Isso garante precisão exata, não importa o tamanho dos números.
+A mesma S-box do AES, copiada diretamente do código-fonte fornecido pelo desafio — é pública, então usá-la aqui não é "trapaça", é só reaproveitar a mesma tabela que o servidor usa internamente.
 
-### `main(limite_k=10_000_000)`
+Comunicação com o servidor
+query(hex_pt)
 
-O laço principal do ataque:
+Faz uma consulta: abre uma conexão nova, lê o prompt do servidor ("Please provide 16 bytes... :"), manda o plaintext em hexadecimal, e lê a resposta até encontrar o texto "leakage result:", extraindo o número que vem depois.
 
-1. Para cada `k` de 0 até o limite definido:
-   - Calcula `alvo = c + k*N`.
-   - Calcula a raiz e-ésima inteira de `alvo`.
-   - Confere se essa raiz, elevada a `e`, realmente reproduz `alvo`
-     exatamente (`r ** e == alvo`). Essa confirmação é o que evita falsos
-     positivos da raiz aproximada.
-2. Assim que encontrar, converte o valor em bytes e tenta decodificar
-   como texto UTF-8.
-3. Se não encontrar nenhum `k` dentro do limite, avisa para aumentar
-   `limite_k` — mas normalmente, se a premissa do desafio estiver certa
-   (M^e só um pouco maior que N), o `k` certo aparece bem no início da
-   busca (valores pequenos, geralmente de 1 dígito).
+Como o servidor fecha a conexão após responder (confirmado pela transcrição do desafio), cada consulta precisa abrir uma conexão TCP nova — por isso essa função usa socket.create_connection dentro de um with, que garante que a conexão é fechada corretamente ao final.
 
----
+plaintext_hex(byte_index, value)
 
-## 3. Como usar
+Função auxiliar: gera uma string hex de 16 bytes, todos zero, exceto no índice byte_index, onde coloca value. Por exemplo, plaintext_hex(3, 0xAB) gera um plaintext com zero em todo lugar, menos no quarto byte, que vale 0xAB.
 
-1. Abra o arquivo `values` do desafio e identifique `N`, `e`, `c`.
-   Repare que aqui o `e` costuma ser pequeno (3, 5, 7...), diferente do
-   RSA comum que usa `65537`.
-2. Preencha as três variáveis no topo do script.
-3. Rode: `python3 mini_rsa.py`.
+Essa é a peça central do ataque: isolar a variação de um único byte por vez.
 
----
-
-## 4. Limitações e cuidados
-
-- **Depende da premissa do desafio**: isso só funciona porque o enunciado
-  garante que `M^e` é "só um pouco maior" que `N`. Se a mensagem tivesse
-  padding robusto (como o OAEP usado no RSA real), `M^e` poderia ser
-  ordens de magnitude maior que `N`, exigindo um `k` enorme — inviável de
-  testar um por um.
-- **Precisão dos números grandes**: por isso a função de raiz inteira
-  evita float completamente. Qualquer tentativa de usar
-  `round(alvo ** (1/e))` pode parecer funcionar às vezes e falhar em
-  outras, de forma imprevisível — por isso o script sempre confirma com
-  `r ** e == alvo` antes de aceitar o resultado.
-- **Mensagem no meio de "lixo"**: alguns desafios colocam a flag
-  cercada de texto de padding (nem sempre no início da mensagem
-  decodificada). Se o `.decode()` falhar, olhe os bytes brutos impressos
-  — a flag pode estar visível no meio deles.
+O ataque, byte por byte
+main()
+Baseline: consulta o servidor com plaintext todo zero e guarda o total (L0). Esse valor serve de referência — qualquer mudança em relação a ele, ao variar um byte específico, é causada só por aquele byte.
+Para cada byte i de 0 a 15:
+Testa um conjunto inicial de valores (samples = range(1, 12)), cada um isolado com plaintext_hex(i, x).
+Para cada valor x, guarda measurements[x] = m(x) - L0 — a diferença em relação ao baseline.
+Testa as 256 chaves possíveis (k de 0 a 255): para cada uma, calcula o que a teoria prevê (bitx - bit0, usando a S-box) e compara com o que foi medido de verdade. Só sobram como "candidatas" as chaves cuja previsão bate com todas as medições feitas.
+Se sobrar mais de uma candidata (raro, mas pode acontecer com poucas amostras), o script testa valores extras de x (range(12, 40)) até que só reste uma.
+Ao final, junta os 16 bytes encontrados numa string hex e monta a flag no formato academy{<chave>}.
+3. Por que esse design específico
+Decisão de design	Motivo
+Isolar um byte por vez (resto do plaintext em zero)	Permite atribuir qualquer mudança no total exclusivamente àquele byte, sem precisar separar a contribuição dos outros 15
+Comparar contra baseline, não valor absoluto	O vazamento é uma soma agregada; só a diferença em relação a uma referência conhecida isola a informação de um byte
+Testar poucos valores de x primeiro, expandir só se precisar	A S-box do AES tem bom comportamento de difusão — poucas amostras já eliminam quase todas as 256 hipóteses erradas, então não vale a pena gastar 256 consultas por byte de cara
+Reconexão por consulta	O servidor fecha a conexão a cada resposta, então não dá para manter uma sessão longa aberta
+4. Limitações e cuidados
+Falta de robustez a ruído: diferente do CPA, este ataque assume que o vazamento é determinístico (a mesma entrada sempre dá o mesmo resultado). Se o servidor tivesse algum componente aleatório no vazamento, o método de "só sobra uma candidata" quebraria facilmente.
+Número de consultas por byte: no pior caso (quando a primeira rodada de amostras não é suficiente), o script pode gastar bem mais consultas por byte. Isso ainda é rápido, mas quanto maior a instabilidade da rede, mais chances de atrasos.
+Dependência do código-fonte do desafio: este ataque só funciona porque tivemos acesso ao encrypt.py e sabíamos exatamente a fórmula do vazamento (Sbox[pt^k] & 1). Em um cenário de side-channel real, a primeira etapa costuma ser justamente descobrir essa relação.
